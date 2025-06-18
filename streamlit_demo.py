@@ -1,8 +1,15 @@
 import streamlit as st
 import os
+import logging
 
 # Set environment to avoid issues
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+# Setup logging
+logger = logging.getLogger(__name__)
+# You might want to configure the logger further (level, handler, formatter)
+# For a simple Streamlit app, basicConfig might be sufficient if not configured elsewhere.
+# logging.basicConfig(level=logging.INFO) # Example: set logging level for the app
 
 st.set_page_config(
     page_title="🔬 Visual Grounding RAG Demo",
@@ -85,7 +92,15 @@ with col1:
                 # Process PDF
                 content = uploaded_file.read()
                 doc_result = processor.process(content)
+
+                if not doc_result or not doc_result.get('chunks'):
+                    st.error("Failed to process the PDF or extract any content chunks. Please try another PDF or check the document format.")
+                    # Optional: log this specific failure point
+                    logger.error("PDF processing failed or yielded no chunks for file: %s", uploaded_file.name if uploaded_file else "Unknown")
+                    return # Stop further processing
                 
+                chunks_from_pdf = doc_result['chunks'] # Renamed to avoid conflict if 'chunks' is used later for 'relevant'
+
                 # Get query
                 if extraction_type == "PICOTT Extraction":
                     query = prompts.get_picott_prompt()
@@ -97,22 +112,29 @@ with col1:
                     query = custom_query
                 
                 # Search and generate answer
-                chunks = doc_result['chunks']
-                relevant = vector_store.search(query, chunks, k=3)
-                answer_data = llm.generate_with_confidence(query, relevant, model)
+                # Ensure 'query' is defined before this block, which it is based on context
+                relevant_chunks = vector_store.search(query, chunks_from_pdf, k=3)
+
+                if not relevant_chunks:
+                    st.warning("Could not retrieve relevant segments from the document for your query. This could be due to the query itself, or the document content. The LLM will try to answer based on a general understanding if possible.")
+                    # Log this situation
+                    logger.warning("Vector search returned no relevant chunks for query: '%s' in file: %s", query, uploaded_file.name if uploaded_file else "Unknown")
+
+                answer_data = llm.generate_with_confidence(query, relevant_chunks, model)
                 
                 # Store in session state
                 st.session_state['results'] = {
                     'answer': answer_data['answer'],
                     'confidence': answer_data['confidence'],
-                    'chunks': relevant,
+                    'chunks': relevant_chunks, # Store the actual relevant chunks used for generation
                     'filename': uploaded_file.name
                 }
                 
                 st.success("✅ Processing complete!")
                 
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                logger.error(f"Streamlit processing error: {str(e)}", exc_info=True) # exc_info=True logs traceback
+                st.error(f"An error occurred during processing: {str(e)}")
 
 with col2:
     st.header("📊 Results")
