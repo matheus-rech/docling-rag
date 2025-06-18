@@ -1,7 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+import logging
 import os
 import io
 import json
@@ -11,19 +12,36 @@ from typing import List, Dict, Optional
 
 # Import our modules
 from core.pdf_processor import PDFProcessor
-from core.llm_client import OllamaClient
-from core.vector_store import VectorStore
+from core.llm_client import OllamaClient # Assuming OllamaClientError might be defined here or it raises generic exceptions
+from core.vector_store import VectorStore, VectorStoreError, VectorStoreInitializationError # Import custom exceptions
 from medical.prompts import MedicalPrompts
 from medical.extractors import PICOTTExtractor
+
+# Setup logger
+logger = logging.getLogger(__name__)
+# Example: Configure logger if needed for FastAPI context
+# logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Medical RAG - Systematic Review Assistant")
 
 # Initialize components
-pdf_processor = PDFProcessor()
-llm_client = OllamaClient()
-vector_store = VectorStore()
-medical_prompts = MedicalPrompts()
-picott_extractor = PICOTTExtractor()
+# Note: If VectorStore() initialization fails here due to model loading,
+# FastAPI will not start correctly, which is an expected behavior.
+# Error handling for that is at the deployment/startup level.
+try:
+    pdf_processor = PDFProcessor()
+    llm_client = OllamaClient() # Assuming this can't fail catastrophically at init or is handled inside
+    vector_store = VectorStore() # This can raise VectorStoreInitializationError
+    medical_prompts = MedicalPrompts()
+    picott_extractor = PICOTTExtractor()
+except VectorStoreInitializationError as e:
+    logger.critical(f"Failed to initialize VectorStore: {e}", exc_info=True)
+    # FastAPI might not start, or you might want to exit explicitly
+    raise RuntimeError(f"Critical component VectorStore failed to initialize: {e}") from e
+except Exception as e:
+    logger.critical(f"An unexpected error occurred during application initialization: {e}", exc_info=True)
+    raise RuntimeError(f"An unexpected error occurred during application initialization: {e}") from e
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -147,14 +165,22 @@ async def process_document(
     query_type: str = Form("custom"),
     query: Optional[str] = Form(None)
 ):
-    # Save uploaded file
-    content = await file.read()
-    
-    # Process PDF
-    doc_result = pdf_processor.process(content)
-    
-    # Setup query based on type
-    if query_type == "picott":
+    try:
+        content = await file.read()
+        if not content:
+            logger.error(f"Uploaded file '{file.filename}' is empty.")
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        # Process PDF
+        doc_result = pdf_processor.process(content)
+        if not doc_result or not doc_result.get('chunks'):
+            logger.error(f"PDF processing failed for {file.filename} or no chunks extracted.")
+            raise HTTPException(status_code=422, detail="Failed to process PDF: No content chunks extracted.")
+
+        doc_chunks = doc_result.get('chunks') # Store for clarity
+
+        # Setup query based on type
+        if query_type == "picott":
         actual_query = medical_prompts.get_picott_prompt()
     elif query_type == "bias":
         actual_query = medical_prompts.get_bias_prompt()
@@ -166,15 +192,22 @@ async def process_document(
         actual_query = query or "Summarize this document"
     
     # Get relevant chunks
-    relevant_chunks = vector_store.search(actual_query, doc_result['chunks'], k=5)
-    
+    # vector_store.search now handles its own internal errors and might return []
+    relevant_chunks = vector_store.search(actual_query, doc_chunks, k=5)
+    if not relevant_chunks and doc_chunks: # Check if chunks were available but search yielded nothing
+        logger.warning(f"Vector search for query '{actual_query}' on file '{file.filename}' yielded no relevant chunks. Proceeding with empty context for LLM.")
+
     # Generate answer with confidence scoring
     answer_data = llm_client.generate_with_confidence(
         query=actual_query,
         context=relevant_chunks,
         model=model
     )
-    
+
+    if answer_data is None or 'answer' not in answer_data or answer_data.get('answer') is None: # Check for valid answer
+        logger.error(f"LLM generation failed or produced no answer for query '{actual_query}' on file '{file.filename}'. Full response: {answer_data}")
+        raise HTTPException(status_code=500, detail="LLM failed to generate an answer.")
+
     # Extract structured data if applicable
     structured_data = None
     if query_type == "picott":
@@ -212,6 +245,19 @@ async def process_document(
         "structured_data": structured_data,
         "visual_grounding": visual_grounding
     }
+    # Specific custom errors from components
+    except VectorStoreError as e:
+        logger.error(f"VectorStore error during processing {file.filename}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"A core data processing error occurred: {str(e)}")
+    # Example for OllamaClientError - if such a specific error type is defined by OllamaClient
+    # except OllamaClientError as e:
+    #     logger.error(f"LLM client error during processing {file.filename}: {str(e)}", exc_info=True)
+    #     raise HTTPException(status_code=500, detail=f"LLM client operation failed: {str(e)}")
+    except HTTPException as e: # Re-raise HTTPExceptions that we threw intentionally
+        raise e
+    except Exception as e: # Catch-all for any other unexpected errors
+        logger.error(f"Unexpected error processing document {file.filename}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected internal server error occurred during document processing.")
 
 @app.get("/export/csv/{session_id}")
 async def export_csv(session_id: str):
