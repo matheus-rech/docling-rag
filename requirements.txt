@@ -1,0 +1,26 @@
+# Core dependencies
+docling>=2.37.0
+langchain>=0.3.25
+langchain-community>=0.3.0
+sentence-transformers>=4.1.0
+faiss-cpu>=1.11.0
+
+# Web framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# Image processing
+matplotlib>=3.10.0
+Pillow>=11.0.0
+opencv-python>=4.8.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Ollama for local LLMs
+ollama>=0.3.0
+
+# Optional but recommended
+python-dotenv>=1.0.0
